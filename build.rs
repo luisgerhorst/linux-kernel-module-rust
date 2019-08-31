@@ -4,7 +4,6 @@ use shlex;
 
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
-use std::process::Command;
 use std::{env, fs};
 
 const INCLUDED_TYPES: &[&str] = &["file_system_type", "mode_t", "umode_t", "ctl_table"];
@@ -85,22 +84,32 @@ fn handle_kernel_version_cfg(bindings_path: &PathBuf) {
     }
 }
 
+fn prepare_cflags(cflags: &str, kernel_dir: &str) -> Vec<String> {
+    let cflag_parts = shlex::split(&cflags).unwrap();
+    let mut cflag_iter = cflag_parts.iter();
+    let mut kernel_args = vec![];
+    while let Some(arg) = cflag_iter.next() {
+        if arg.starts_with("-I") {
+            kernel_args.push(format!("-I{}/{}", kernel_dir, &arg[2..]));
+        } else if arg == "-include" {
+            kernel_args.push(arg.to_string());
+            kernel_args.push(format!("{}/{}", kernel_dir, cflag_iter.next().unwrap()));
+        } else {
+            kernel_args.push(arg.to_string());
+        }
+    }
+    return kernel_args;
+}
+
 fn main() {
     println!("cargo:rerun-if-env-changed=KDIR");
     println!("cargo:rerun-if-env-changed=CLANG");
+    println!("cargo:rerun-if-env-changed=KERNEL_CLFAGS");
     println!("cargo:rerun-if-changed=kernel-cflags-finder/Makefile");
-    let output = Command::new("make")
-        .arg("-C")
-        .arg("kernel-cflags-finder")
-        .arg("-s")
-        .output()
-        .unwrap();
-    if !output.status.success() {
-        eprintln!("kernel-cflags-finder did not succeed");
-        eprintln!("stdout: {}", std::str::from_utf8(&output.stdout).unwrap());
-        eprintln!("stderr: {}", std::str::from_utf8(&output.stderr).unwrap());
-        std::process::exit(1);
-    }
+
+    let kernel_cflags = env::var("KERNEL_CLFAGS").expect("Must be invoked from kernel makefile");
+    let kernel_dir = env::var("KDIR").expect("Must be invoked from kernel makefile");
+    let kernel_args = prepare_cflags(&kernel_cflags, &kernel_dir);
 
     let mut builder = bindgen::Builder::default()
         .use_core()
@@ -108,9 +117,10 @@ fn main() {
         .derive_default(true)
         .rustfmt_bindings(true);
 
+    // TODO: parameterize
     builder = builder.clang_arg("--target=x86_64-linux-kernel");
-    for arg in shlex::split(std::str::from_utf8(&output.stdout).unwrap()).unwrap() {
-        builder = builder.clang_arg(arg.to_string());
+    for arg in kernel_args.iter() {
+        builder = builder.clang_arg(arg.clone());
     }
 
     println!("cargo:rerun-if-changed=src/bindings_helper.h");
@@ -138,12 +148,11 @@ fn main() {
     handle_kernel_version_cfg(&out_path.join("bindings.rs"));
 
     let mut builder = cc::Build::new();
-    println!("cargo:rerun-if-env-changed=CLANG");
     builder.compiler(env::var("CLANG").unwrap_or("clang".to_string()));
     builder.target("x86_64-linux-kernel");
     builder.warnings(false);
     builder.file("src/helpers.c");
-    for arg in shlex::split(std::str::from_utf8(&output.stdout).unwrap()).unwrap() {
+    for arg in kernel_args.iter() {
         builder.flag(&arg);
     }
     builder.compile("helpers");
